@@ -36,32 +36,20 @@ async function loadCookies(context: BrowserContext): Promise<boolean> {
 // --- Auth flow ---
 
 async function ensureLoggedIn(page: Page, context: BrowserContext): Promise<boolean> {
-  // Try loading dashboard with existing cookies
   const hasCookies = await loadCookies(context);
 
-  await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" });
+  if (hasCookies) {
+    // Try the dashboard with saved cookies
+    console.log("  🔄 Trying saved session...");
+    await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" });
 
-  // Wait for either the dashboard sidebar or a login form
-  try {
-    await page.waitForSelector('[id="networth-balance"], [id="sidebar-container"], input[type="text"], input[type="email"]', {
-      timeout: 15000,
-    });
-  } catch {
-    // Might still be loading
-  }
-
-  // Check if we're on the dashboard
-  const netWorth = await page.$('[id="networth-balance"]');
-  if (netWorth) {
-    console.log("  ✅ Already logged in");
-    return true;
-  }
-
-  // Check for sidebar with net worth data (alternative selector)
-  const sidebar = await page.$('text=NET WORTH');
-  if (sidebar) {
-    console.log("  ✅ Already logged in (sidebar detected)");
-    return true;
+    try {
+      await page.waitForSelector('[id="networth-balance"]', { timeout: 20000 });
+      console.log("  ✅ Logged in with saved cookies");
+      return true;
+    } catch {
+      console.log("  ⚠️  Saved cookies expired");
+    }
   }
 
   if (HEADLESS) {
@@ -69,20 +57,18 @@ async function ensureLoggedIn(page: Page, context: BrowserContext): Promise<bool
     return false;
   }
 
-  // Manual login flow
-  console.log("\n  🔐 Not logged in. Opening browser for manual login...");
+  // No cookies or expired — go straight to login page
+  console.log("\n  🔐 Opening login page...");
   console.log("  👉 Please log in to Empower in the browser window.");
-  console.log("  ⏳ Waiting for dashboard to load after login...\n");
+  console.log("  ⏳ Waiting up to 5 minutes for login + 2FA...\n");
 
-  // Navigate to login page
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
 
-  // Wait for the user to complete login and reach the dashboard
-  // This will wait up to 5 minutes for manual login + 2FA
+  // Wait for user to complete login and land on dashboard
   try {
     await page.waitForURL("**/dashboard/**", { timeout: 300000 });
-    // Wait for the sidebar to actually render
-    await page.waitForSelector('[id="networth-balance"], text=NET WORTH', { timeout: 30000 });
+    console.log("  🔄 Redirected to dashboard, waiting for data...");
+    await page.waitForSelector('[id="networth-balance"]', { timeout: 30000 });
     console.log("  ✅ Login successful!");
     await saveCookies(context);
     return true;
