@@ -51,7 +51,9 @@ async function ensureLoggedIn(page: Page, context: BrowserContext): Promise<bool
       console.log("  ✅ Logged in with saved cookies");
       return true;
     } catch {
-      console.log("  ⚠️  Saved cookies expired");
+      console.log("  ⚠️  Saved cookies expired, clearing for fresh login...");
+      // Clear stale cookies so they don't interfere with fresh login
+      await context.clearCookies();
     }
   }
 
@@ -60,23 +62,44 @@ async function ensureLoggedIn(page: Page, context: BrowserContext): Promise<bool
     return false;
   }
 
-  // No cookies or expired — go straight to login page
+  // Fresh login — no stale cookies to confuse things
   console.log("\n  🔐 Opening login page...");
   console.log("  👉 Please log in to Empower in the browser window.");
   console.log("  ⏳ Waiting up to 5 minutes for login + 2FA...\n");
 
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
 
-  // Wait for user to complete login and land on dashboard
+  // Wait for user to complete login
+  // Monitor for dashboard URL OR the networth element appearing
+  // Empower's redirect chain can be unpredictable, so watch for both
   try {
-    await page.waitForURL("**/dashboard/**", { timeout: 300000 });
-    console.log("  🔄 Redirected to dashboard, waiting for data...");
-    await page.waitForSelector('[id="networth-balance"]', { timeout: 30000 });
+    // Poll for success: either URL changes to dashboard or we see the sidebar
+    const result = await Promise.race([
+      page.waitForURL("**/dashboard/**", { timeout: 300000 }).then(() => "url"),
+      page.waitForSelector('[id="networth-balance"]', { timeout: 300000 }).then(() => "selector"),
+    ]);
+    console.log(`  🔄 Login detected via ${result}, waiting for dashboard data...`);
+
+    // If we got the URL change, still need to wait for content
+    if (result === "url") {
+      try {
+        await page.waitForSelector('[id="networth-balance"]', { timeout: 30000 });
+      } catch {
+        // Maybe the page needs a reload
+        console.log("  🔄 Dashboard loaded but no data yet, reloading...");
+        await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" });
+        await page.waitForSelector('[id="networth-balance"]', { timeout: 30000 });
+      }
+    }
+
     console.log("  ✅ Login successful!");
     await saveCookies(context);
     return true;
-  } catch {
-    console.error("  ❌ Login timed out after 5 minutes.");
+  } catch (err) {
+    // Log where we ended up for debugging
+    const currentUrl = page.url();
+    console.error(`  ❌ Login failed. Current URL: ${currentUrl}`);
+    console.error(`  ❌ Error: ${err}`);
     return false;
   }
 }
