@@ -15,6 +15,8 @@ const COOKIE_PATH = resolve(PROJECT_ROOT, process.env.COOKIE_PATH || "cookies.js
 const LOGIN_URL = process.env.EMPOWER_LOGIN_URL || "https://ira.empower-retirement.com/participant/#/sfd-login?accu=MYERIRA";
 const DASHBOARD_URL = process.env.EMPOWER_DASHBOARD_URL || "https://ira.empower-retirement.com/dashboard/#/user/home";
 const HEADLESS = process.env.HEADLESS === "true";
+const EMPOWER_USERNAME = process.env.EMPOWER_USERNAME;
+const EMPOWER_PASSWORD = process.env.EMPOWER_PASSWORD;
 
 // --- Cookie management ---
 
@@ -64,10 +66,46 @@ async function ensureLoggedIn(page: Page, context: BrowserContext): Promise<bool
 
   // Fresh login — no stale cookies to confuse things
   console.log("\n  🔐 Opening login page...");
-  console.log("  👉 Please log in to Empower in the browser window.");
-  console.log("  ⏳ Waiting up to 5 minutes for login + 2FA...\n");
-
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
+
+  // Auto-fill credentials if provided
+  if (EMPOWER_USERNAME && EMPOWER_PASSWORD) {
+    console.log("  🔑 Auto-filling credentials...");
+    try {
+      // Wait for the login form to render
+      await page.waitForSelector('input[type="text"], input[type="email"], input[id*="user"], input[name*="user"]', { timeout: 15000 });
+
+      // Find and fill username field
+      const usernameField = await page.$('input[type="text"], input[type="email"], input[id*="user"], input[name*="user"]');
+      if (usernameField) {
+        await usernameField.fill(EMPOWER_USERNAME);
+        console.log("  ✏️  Username filled");
+      }
+
+      // Find and fill password field
+      const passwordField = await page.$('input[type="password"]');
+      if (passwordField) {
+        await passwordField.fill(EMPOWER_PASSWORD);
+        console.log("  ✏️  Password filled");
+      }
+
+      // Click the login/submit button
+      const submitButton = await page.$('button[type="submit"], button:has-text("Log In"), button:has-text("Sign In"), button:has-text("Submit")');
+      if (submitButton) {
+        await submitButton.click();
+        console.log("  🚀 Submitted login form");
+      }
+
+      console.log("  ⏳ Waiting for 2FA...\n");
+    } catch (err) {
+      console.log(`  ⚠️  Auto-fill failed: ${err}`);
+      console.log("  👉 Please log in manually in the browser window.");
+    }
+  } else {
+    console.log("  👉 Please log in to Empower in the browser window.");
+    console.log("  💡 Tip: set EMPOWER_USERNAME and EMPOWER_PASSWORD in .env for auto-fill");
+  }
+  console.log("  ⏳ Waiting up to 5 minutes for login + 2FA...\n");
 
   // Wait for user to complete login
   // Monitor for dashboard URL OR the networth element appearing
