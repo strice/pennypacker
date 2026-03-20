@@ -433,6 +433,10 @@ async function scrapeAllHoldings(
         continue;
       }
 
+      // Verify we're on the right account's detail page
+      const pageHeading = await page.innerText('h1').catch(() => "");
+      console.log(`  📄 Detail page: ${pageHeading}`);
+
       // Click the Holdings tab
       console.log("  📋 Clicking Holdings tab...");
       await page.click('a:has-text("Holdings")');
@@ -447,13 +451,14 @@ async function scrapeAllHoldings(
         continue;
       }
 
-      // Small delay for all data to populate
-      await page.waitForTimeout(1500);
+      // Wait for data to populate
+      await page.waitForTimeout(2000);
 
-      // Scrape the holdings grid
+      // Scrape the holdings grid (scope to main content area to avoid picking up stale data)
       const holdings = await page.evaluate(() => {
-        const gridRows = document.querySelectorAll('[role="grid"] [role="rowgroup"]:last-child [role="row"]');
-        const tableRows = document.querySelectorAll('table tbody tr');
+        const main = document.querySelector('main') || document;
+        const gridRows = main.querySelectorAll('[role="grid"] [role="rowgroup"]:last-child [role="row"]');
+        const tableRows = main.querySelectorAll('table tbody tr');
         const rows = gridRows.length > 0 ? gridRows : tableRows;
 
         const results: Array<{
@@ -481,10 +486,11 @@ async function scrapeAllHoldings(
           if (holdingCell.toLowerCase() === "holding") continue;
           if (holdingCell === "Cash Cash" && valueText === "$0.00") continue;
 
-          const tickerMatch = holdingCell.match(/^([A-Z]{2,6})\b/);
+          // Ticker is all-caps 2-6 chars at start, may or may not have space before fund name
+          const tickerMatch = holdingCell.match(/^([A-Z]{2,6})(?:\s+|(?=[A-Z][a-z]))/);
           const ticker = tickerMatch ? tickerMatch[1] : null;
           const fundName = ticker
-            ? holdingCell.replace(ticker, "").trim()
+            ? holdingCell.slice(ticker.length).trim()
             : holdingCell;
 
           const parseDollar = (t: string) => parseFloat(t.replace(/[^0-9.\-]/g, "")) || 0;
@@ -596,7 +602,13 @@ export async function scrapeEmpower(): Promise<number> {
 
       console.log(`  💰 ${acct.institution} ${acct.accountNumber || acct.name}: $${acct.balance.toLocaleString()} [${acct.category}]`);
 
-      if (acct.category === "investment") {
+      // Only scrape holdings for brokerage accounts with a detail page
+      // Skip manual entries (I-Bonds, TreasuryDirect) that don't have holdings views
+      const skipForHoldings = acct.isManual
+        || acct.institution.includes("Series")
+        || acct.institution.includes("TreasuryDirect")
+        || acct.name.includes("TreasuryDirect");
+      if (acct.category === "investment" && !skipForHoldings) {
         investmentAccounts.push({
           accountId,
           institution: acct.institution,
