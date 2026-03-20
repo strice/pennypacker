@@ -373,149 +373,163 @@ function categorizeAccount(
 }
 
 // --- Holdings scraper ---
+// Strategy: click account in sidebar → click Holdings tab → scrape grid → click back to dashboard
+// Must stay within the SPA — page.goto() with hash URLs doesn't trigger proper SPA routing
 
-async function findAccountUrls(page: Page): Promise<Map<string, string>> {
-  // When you click an account in the sidebar, the URL changes to include a `ua=` param.
-  // We can find these by looking at where sidebar account clicks navigate to.
-  // Strategy: click each investment account, capture the URL, go back.
-  // But that's fragile. Better: look for the ua param in the page's network or DOM.
+async function scrapeAllHoldings(
+  page: Page,
+  investmentAccounts: Array<{ accountId: number; institution: string; accountNumber: string | null; name: string }>
+): Promise<Map<number, ScrapedHolding[]>> {
+  const allHoldings = new Map<number, ScrapedHolding[]>();
 
-  // From our exploration, the detail URL pattern is:
-  // /dashboard/#/accounts/details?ua=XXXXXXX&firmName=Vanguard
-  // We need to discover the `ua` values.
-
-  // Let's find them by evaluating click handlers or by clicking and capturing URLs
-  const urls = new Map<string, string>();
-
-  console.log("  🔍 Discovering account detail URLs...");
-
-  // Find all sidebar account buttons and click each to discover their URLs
-  const buttons = await page.$$('button[data-testid="click-account-card"]');
-  console.log(`  📋 Found ${buttons.length} account cards`);
-
-  for (const button of buttons) {
-    const buttonText = await button.innerText().catch(() => "");
-    const cleanText = buttonText.replace(/\n/g, " ").trim();
-
-    // Only care about investment accounts (have Vanguard, Fidelity, CareFirst HSA Investment)
-    const isInvestment = /vanguard|fidelity|hsa investment/i.test(cleanText);
-    if (!isInvestment) continue;
-
-    console.log(`  🖱️  Clicking: ${cleanText.slice(0, 60)}...`);
+  for (const acct of investmentAccounts) {
+    const label = `${acct.institution} ${acct.accountNumber || acct.name}`;
+    console.log(`\n📈 Scraping holdings for ${label}...`);
 
     try {
-      await button.click();
-      await page.waitForURL("**/accounts/details**", { timeout: 10000 });
-      const url = page.url();
-      console.log(`  📎 URL: ${url}`);
+      // Find and click this account's button in the sidebar
+      // The sidebar persists across views, so we can always click from it
+      const buttonSelector = acct.accountNumber
+        ? `button:has-text("${acct.institution}"):has-text("${acct.accountNumber}")`
+        : `button:has-text("${acct.institution}"):has-text("${acct.name}")`;
 
-      // Extract account identifier from button text
-      const acctMatch = cleanText.match(/(\w+)\s+(\d{4})\s+•/);
-      if (acctMatch) {
-        const key = `${acctMatch[1]} ${acctMatch[2]}`;
-        urls.set(key, url);
-      } else {
-        // For accounts without 4-digit number (like CareFirst HSA Investment)
-        const nameMatch = cleanText.match(/^(.+?)\s+•/);
-        if (nameMatch) urls.set(nameMatch[1].trim(), url);
+      console.log(`  🔍 Looking for: ${buttonSelector}`);
+
+      // Wait for sidebar buttons to be present
+      await page.waitForSelector('button[data-testid="click-account-card"]', { timeout: 10000 });
+
+      // Use data-testid buttons and match by text content
+      const buttons = await page.$$('button[data-testid="click-account-card"]');
+      let clicked = false;
+
+      for (const btn of buttons) {
+        const text = await btn.innerText().catch(() => "");
+        const hasInstitution = text.includes(acct.institution);
+        const hasIdentifier = acct.accountNumber
+          ? text.includes(acct.accountNumber)
+          : text.includes(acct.name);
+
+        if (hasInstitution && hasIdentifier) {
+          console.log(`  🖱️  Clicking: ${text.replace(/\n/g, " ").slice(0, 60)}...`);
+          await btn.click();
+          clicked = true;
+          break;
+        }
       }
 
-      // Go back to dashboard
-      await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" });
-      await page.waitForSelector('[id="networth-balance"]', { timeout: 15000 });
-    } catch (err) {
-      console.log(`  ⚠️  Could not get URL for: ${cleanText.slice(0, 40)} — ${err}`);
-      // Make sure we're back on dashboard
-      await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
-      await page.waitForSelector('[id="networth-balance"]', { timeout: 15000 }).catch(() => {});
-    }
-  }
+      if (!clicked) {
+        console.log(`  ⚠️  Could not find sidebar button for ${label}`);
+        continue;
+      }
 
-  return urls;
-}
+      // Wait for the detail view to load (look for Holdings tab link)
+      try {
+        await page.waitForSelector('a:has-text("Holdings")', { timeout: 10000 });
+      } catch {
+        console.log(`  ⚠️  Detail page didn't load for ${label}, skipping`);
+        // Click the logo/home to get back to dashboard
+        await page.click('a:has-text("Go to dashboard")').catch(() => {});
+        await page.waitForSelector('[id="networth-balance"]', { timeout: 10000 }).catch(() => {});
+        continue;
+      }
 
-async function scrapeHoldingsFromUrl(page: Page, detailUrl: string): Promise<ScrapedHolding[]> {
-  // Navigate to the holdings tab directly
-  const holdingsUrl = detailUrl.includes("tabId=")
-    ? detailUrl.replace(/tabId=\w+/, "tabId=holdings")
-    : detailUrl + "&tabId=holdings";
+      // Click the Holdings tab
+      console.log("  📋 Clicking Holdings tab...");
+      await page.click('a:has-text("Holdings")');
 
-  console.log(`  🔗 Navigating to holdings: ${holdingsUrl.slice(0, 80)}...`);
-  await page.goto(holdingsUrl, { waitUntil: "domcontentloaded" });
+      // Wait for the holdings grid to render
+      try {
+        await page.waitForSelector('[role="grid"] [role="gridcell"], table td', { timeout: 10000 });
+      } catch {
+        console.log(`  ⚠️  Holdings grid didn't render for ${label}`);
+        await page.click('a:has-text("Go to dashboard")').catch(() => {});
+        await page.waitForSelector('[id="networth-balance"]', { timeout: 10000 }).catch(() => {});
+        continue;
+      }
 
-  // Wait for the holdings grid to render
-  try {
-    await page.waitForSelector('[role="grid"], table', { timeout: 15000 });
-  } catch {
-    console.log("  ⚠️  No holdings grid found, checking page...");
-    const pageText = await page.innerText('body').catch(() => "");
-    console.log(`  📄 Page contains: ${pageText.slice(0, 200)}...`);
-    return [];
-  }
+      // Small delay for all data to populate
+      await page.waitForTimeout(1500);
 
-  // Small delay for data to populate
-  await page.waitForTimeout(1500);
+      // Scrape the holdings grid
+      const holdings = await page.evaluate(() => {
+        const gridRows = document.querySelectorAll('[role="grid"] [role="rowgroup"]:last-child [role="row"]');
+        const tableRows = document.querySelectorAll('table tbody tr');
+        const rows = gridRows.length > 0 ? gridRows : tableRows;
 
-  const holdings = await page.evaluate(() => {
-    // Try both table and grid-role selectors
-    const gridRows = document.querySelectorAll('[role="grid"] [role="rowgroup"]:last-child [role="row"]');
-    const tableRows = document.querySelectorAll('table tbody tr');
-    const rows = gridRows.length > 0 ? gridRows : tableRows;
+        const results: Array<{
+          ticker: string | null;
+          fundName: string;
+          shares: number;
+          price: number;
+          value: number;
+          dayChangeAmount: number | null;
+          dayChangePercent: number | null;
+        }> = [];
 
-    console.log(`Found ${rows.length} rows`); // browser console
+        for (const row of rows) {
+          const cells = row.querySelectorAll('td, [role="gridcell"]');
+          if (cells.length < 4) continue;
 
-    const results: Array<{
-      ticker: string | null;
-      fundName: string;
-      shares: number;
-      price: number;
-      value: number;
-      dayChangeAmount: number | null;
-      dayChangePercent: number | null;
-    }> = [];
+          const holdingCell = cells[0]?.textContent?.trim() || "";
+          const sharesText = cells[1]?.textContent?.trim() || "0";
+          const priceText = cells[2]?.textContent?.trim() || "0";
+          const valueText = cells[3]?.textContent?.trim() || "0";
+          const dayChangeText = cells[4]?.textContent?.trim() || "0";
+          const dayPctText = cells[5]?.textContent?.trim() || "0";
 
-    for (const row of rows) {
-      const cells = row.querySelectorAll('td, [role="gridcell"]');
-      if (cells.length < 4) continue;
+          if (holdingCell.toLowerCase().includes("grand total")) continue;
+          if (holdingCell.toLowerCase() === "holding") continue;
+          if (holdingCell === "Cash Cash" && valueText === "$0.00") continue;
 
-      const holdingCell = cells[0]?.textContent?.trim() || "";
-      const sharesText = cells[1]?.textContent?.trim() || "0";
-      const priceText = cells[2]?.textContent?.trim() || "0";
-      const valueText = cells[3]?.textContent?.trim() || "0";
-      const dayChangeText = cells[4]?.textContent?.trim() || "0";
-      const dayPctText = cells[5]?.textContent?.trim() || "0";
+          const tickerMatch = holdingCell.match(/^([A-Z]{2,6})\b/);
+          const ticker = tickerMatch ? tickerMatch[1] : null;
+          const fundName = ticker
+            ? holdingCell.replace(ticker, "").trim()
+            : holdingCell;
 
-      // Skip header-like rows and totals
-      if (holdingCell.toLowerCase().includes("grand total")) continue;
-      if (holdingCell.toLowerCase() === "holding") continue;
-      if (holdingCell === "Cash Cash" && valueText === "$0.00") continue;
+          const parseDollar = (t: string) => parseFloat(t.replace(/[^0-9.\-]/g, "")) || 0;
+          const parsePercent = (t: string) => parseFloat(t.replace(/[^0-9.\-]/g, "")) || 0;
 
-      // Extract ticker — first word if all caps 2-6 chars
-      const tickerMatch = holdingCell.match(/^([A-Z]{2,6})\b/);
-      const ticker = tickerMatch ? tickerMatch[1] : null;
-      const fundName = ticker
-        ? holdingCell.replace(ticker, "").trim()
-        : holdingCell;
+          results.push({
+            ticker,
+            fundName,
+            shares: parseFloat(sharesText.replace(/,/g, "")) || 0,
+            price: parseDollar(priceText),
+            value: parseDollar(valueText),
+            dayChangeAmount: parseDollar(dayChangeText),
+            dayChangePercent: parsePercent(dayPctText),
+          });
+        }
 
-      const parseDollar = (t: string) => parseFloat(t.replace(/[^0-9.\-]/g, "")) || 0;
-      const parsePercent = (t: string) => parseFloat(t.replace(/[^0-9.\-]/g, "")) || 0;
-
-      results.push({
-        ticker,
-        fundName,
-        shares: parseFloat(sharesText.replace(/,/g, "")) || 0,
-        price: parseDollar(priceText),
-        value: parseDollar(valueText),
-        dayChangeAmount: parseDollar(dayChangeText),
-        dayChangePercent: parsePercent(dayPctText),
+        return results;
       });
+
+      console.log(`  📊 Found ${holdings.length} holdings`);
+      allHoldings.set(acct.accountId, holdings);
+
+      // Navigate back to dashboard by clicking the logo
+      console.log("  🔙 Back to dashboard...");
+      await page.click('a:has-text("Go to dashboard")').catch(async () => {
+        // Fallback: use browser back
+        await page.goBack();
+      });
+      await page.waitForSelector('[id="networth-balance"]', { timeout: 15000 });
+
+    } catch (err) {
+      console.error(`  ⚠️  Failed to scrape holdings for ${label}: ${err}`);
+      // Try to recover to dashboard
+      try {
+        await page.click('a:has-text("Go to dashboard")').catch(() => {});
+        await page.waitForSelector('[id="networth-balance"]', { timeout: 10000 });
+      } catch {
+        console.log("  🔄 Recovering by reloading dashboard...");
+        await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" });
+        await page.waitForSelector('[id="networth-balance"]', { timeout: 15000 });
+      }
     }
+  }
 
-    return results;
-  });
-
-  console.log(`  📊 Found ${holdings.length} holdings`);
-  return holdings;
+  return allHoldings;
 }
 
 // --- Main scrape orchestrator ---
@@ -564,8 +578,8 @@ export async function scrapeEmpower(): Promise<number> {
       sidebar.totalLiabilities
     );
 
-    // Insert accounts and track investment account IDs
-    const accountIdMap = new Map<string, number>(); // "Institution AcctNum" -> db id
+    // Insert accounts and collect investment accounts for holdings scraping
+    const investmentAccounts: Array<{ accountId: number; institution: string; accountNumber: string | null; name: string }> = [];
 
     for (const acct of sidebar.accounts) {
       const accountId = insertAccount(snapshotId, {
@@ -582,51 +596,31 @@ export async function scrapeEmpower(): Promise<number> {
 
       console.log(`  💰 ${acct.institution} ${acct.accountNumber || acct.name}: $${acct.balance.toLocaleString()} [${acct.category}]`);
 
-      // Map for matching with discovered URLs
-      const key = acct.accountNumber
-        ? `${acct.institution} ${acct.accountNumber}`
-        : `${acct.institution} ${acct.name}`;
-      accountIdMap.set(key, accountId);
+      if (acct.category === "investment") {
+        investmentAccounts.push({
+          accountId,
+          institution: acct.institution,
+          accountNumber: acct.accountNumber,
+          name: acct.name,
+        });
+      }
     }
 
-    // Discover account detail URLs by clicking sidebar buttons
-    const accountUrls = await findAccountUrls(page);
-    console.log(`\n  🗺️  Discovered ${accountUrls.size} investment account URLs`);
+    // Scrape holdings for each investment account (click-based, stays in SPA)
+    const allHoldings = await scrapeAllHoldings(page, investmentAccounts);
 
-    // Scrape holdings for each discovered investment account
-    for (const [ref, url] of accountUrls) {
-      console.log(`\n📈 Scraping holdings for ${ref}...`);
-
-      // Find matching account ID
-      const accountId = accountIdMap.get(ref);
-      if (!accountId) {
-        // Try fuzzy match
-        const fuzzyKey = [...accountIdMap.keys()].find(k => k.includes(ref) || ref.includes(k));
-        if (!fuzzyKey) {
-          console.log(`  ⚠️  No matching account in DB for "${ref}", skipping`);
-          continue;
-        }
-        console.log(`  🔗 Fuzzy matched "${ref}" → "${fuzzyKey}"`);
-      }
-      const dbId = accountId || accountIdMap.get([...accountIdMap.keys()].find(k => k.includes(ref) || ref.includes(k))!)!;
-
-      try {
-        const holdings = await scrapeHoldingsFromUrl(page, url);
-
-        for (const holding of holdings) {
-          insertHolding(snapshotId, dbId, {
-            ticker: holding.ticker,
-            fund_name: holding.fundName,
-            shares: holding.shares,
-            price: holding.price,
-            value: holding.value,
-            day_change_amount: holding.dayChangeAmount,
-            day_change_percent: holding.dayChangePercent,
-          });
-          console.log(`    ${holding.ticker || "---"} | ${holding.fundName.slice(0, 40)} | ${holding.shares} shares @ $${holding.price} = $${holding.value.toLocaleString()}`);
-        }
-      } catch (err) {
-        console.error(`  ⚠️  Failed to scrape holdings for ${ref}: ${err}`);
+    for (const [accountId, holdings] of allHoldings) {
+      for (const holding of holdings) {
+        insertHolding(snapshotId, accountId, {
+          ticker: holding.ticker,
+          fund_name: holding.fundName,
+          shares: holding.shares,
+          price: holding.price,
+          value: holding.value,
+          day_change_amount: holding.dayChangeAmount,
+          day_change_percent: holding.dayChangePercent,
+        });
+        console.log(`    ${holding.ticker || "---"} | ${holding.fundName.slice(0, 40)} | ${holding.shares} shares @ $${holding.price} = $${holding.value.toLocaleString()}`);
       }
     }
 
