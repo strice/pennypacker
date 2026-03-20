@@ -13,6 +13,8 @@
     "history": "bun src/index.ts history",
     "holdings": "bun src/index.ts holdings",
     "accounts": "bun src/index.ts accounts",
+    "spending": "bun src/index.ts spending",
+    "allocation": "bun src/index.ts allocation",
     "mcp": "bun src/mcp/server.ts"
   },
   "dependencies": {

@@ -58,7 +58,7 @@ export function table(headers: string[], rows: string[][], columnAlign?: ("left"
   const align = columnAlign || headers.map(() => "left");
 
   // Calculate column widths (strip ANSI codes for width calculation)
-  const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+  const stripAnsi = (s: string) => (s || "").replace(/\x1b\[[0-9;]*m/g, "");
   const widths = headers.map((h, i) => {
     const maxRow = Math.max(...rows.map(r => stripAnsi(r[i] || "").length));
     return Math.max(stripAnsi(h).length, maxRow);

@@ -74,6 +74,21 @@ switch (command) {
     break;
   }
 
+  case "spending":
+  case "txn":
+  case "transactions": {
+    const { showSpending } = await import("./cli/spending");
+    showSpending(args[0]);
+    break;
+  }
+
+  case "allocation":
+  case "alloc": {
+    const { showAllocation } = await import("./cli/allocation");
+    showAllocation();
+    break;
+  }
+
   case "help":
   case "--help":
   case "-h": {
@@ -87,6 +102,8 @@ Commands:
   holdings [filter]   Investment holdings detail (filter by institution/acct#)
   history [days]      Net worth history with changes (default: 30 days)
   accounts            Full account list
+  spending [filter]   Spending by category + recent transactions
+  allocation          Portfolio allocation breakdown + performance
 
 First run:
   1. cp .env.example .env

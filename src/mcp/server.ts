@@ -41,6 +41,10 @@ import {
   getSnapshotHistory,
   getNetWorthChange,
   getTopHoldings,
+  getTransactionsForSnapshot,
+  getSpendingByCategory,
+  getAllocationsForSnapshot,
+  getPerformanceForSnapshot,
 } from "../db/queries";
 
 // Initialize database
@@ -111,8 +115,37 @@ const TOOLS = [
     },
   },
   {
+    name: "pennypacker_spending",
+    description: "Get spending breakdown by category and recent transactions. Shows where money is going.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        category: {
+          type: "string",
+          description: "Filter transactions by category name",
+        },
+      },
+    },
+  },
+  {
+    name: "pennypacker_allocation",
+    description: "Get true portfolio allocation by asset class (US stocks, Intl stocks, US bonds, Intl bonds, Cash, Alternatives). Unwraps target-date funds to show effective exposure.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "pennypacker_performance",
+    description: "Get 90-day performance by account with returns, income, and benchmarks.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
     name: "pennypacker_query",
-    description: "Run a read-only SQL query against the Pennypacker database. Tables: snapshots, accounts, holdings.",
+    description: "Run a read-only SQL query against the Pennypacker database. Tables: snapshots, accounts, holdings, transactions, allocations, performance.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -223,6 +256,93 @@ function handleTool(name: string, args: Record<string, unknown>): unknown {
           liabilities: s.total_liabilities,
         })),
         changes,
+      };
+    }
+
+    case "pennypacker_spending": {
+      const snapshot = getLatestSnapshot();
+      if (!snapshot) return { error: "No data." };
+
+      const categories = getSpendingByCategory(snapshot.id);
+      let transactions = getTransactionsForSnapshot(snapshot.id);
+      const filter = args.category as string | undefined;
+      if (filter) {
+        transactions = transactions.filter(t =>
+          t.category.toLowerCase().includes(filter.toLowerCase()) ||
+          t.description.toLowerCase().includes(filter.toLowerCase())
+        );
+      }
+
+      return {
+        scraped_at: snapshot.scraped_at,
+        spending_by_category: categories.map(c => ({
+          category: c.category,
+          total: c.total,
+          transaction_count: c.count,
+        })),
+        total_spending: categories.reduce((sum, c) => sum + c.total, 0),
+        transactions: transactions.slice(0, 50).map(t => ({
+          date: t.date,
+          description: t.description,
+          category: t.category,
+          amount: t.amount,
+          account: t.account_name,
+        })),
+        transaction_count: transactions.length,
+      };
+    }
+
+    case "pennypacker_allocation": {
+      const snapshot = getLatestSnapshot();
+      if (!snapshot) return { error: "No data." };
+
+      const allocations = getAllocationsForSnapshot(snapshot.id);
+      const stocks = allocations
+        .filter(a => a.asset_class.toLowerCase().includes("stock"))
+        .reduce((sum, a) => sum + a.percent_total, 0);
+      const bonds = allocations
+        .filter(a => a.asset_class.toLowerCase().includes("bond"))
+        .reduce((sum, a) => sum + a.percent_total, 0);
+      const intl = allocations
+        .filter(a => a.asset_class.toLowerCase().includes("intl"))
+        .reduce((sum, a) => sum + a.percent_total, 0);
+
+      return {
+        scraped_at: snapshot.scraped_at,
+        allocations: allocations.map(a => ({
+          asset_class: a.asset_class,
+          value: a.value,
+          percent: a.percent_total,
+          day_change_pct: a.day_change_percent,
+        })),
+        total_invested: allocations.reduce((sum, a) => sum + a.value, 0),
+        ratios: {
+          stocks_pct: stocks,
+          bonds_pct: bonds,
+          international_pct: intl,
+          domestic_pct: 100 - intl - (100 - stocks - bonds),
+        },
+      };
+    }
+
+    case "pennypacker_performance": {
+      const snapshot = getLatestSnapshot();
+      if (!snapshot) return { error: "No data." };
+
+      const performances = getPerformanceForSnapshot(snapshot.id);
+      return {
+        scraped_at: snapshot.scraped_at,
+        accounts: performances.map(p => ({
+          account: p.account_name,
+          type: p.account_type,
+          period_return_pct: p.period_pct,
+          prior_day_pct: p.prior_day_pct,
+          income: p.income,
+          balance: p.balance,
+          period_days: p.period_days,
+        })),
+        total_income: performances.reduce((sum, p) => sum + p.income, 0),
+        total_balance: performances.reduce((sum, p) => sum + p.balance, 0),
       };
     }
 

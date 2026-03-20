@@ -5,6 +5,9 @@ import {
   insertSnapshot,
   insertAccount,
   insertHolding,
+  insertTransaction,
+  insertAllocation,
+  insertPerformance,
   getLatestSnapshot,
   getAccountsForSnapshot,
 } from "../db/queries";
@@ -554,6 +557,334 @@ async function scrapeAllHoldings(
   return allHoldings;
 }
 
+// --- Transactions scraper (from Cash Flow page) ---
+
+interface ScrapedTransaction {
+  date: string;
+  accountName: string;
+  description: string;
+  category: string;
+  tags: string | null;
+  amount: number;
+}
+
+async function scrapeTransactions(page: Page): Promise<ScrapedTransaction[]> {
+  console.log("\n💳 Scraping transactions...");
+
+  // Navigate to Cash Flow page via menu
+  const budgetingBtn = await page.$('button:has-text("Budgeting")');
+  if (!budgetingBtn) {
+    console.log("  ⚠️  Could not find Budgeting menu");
+    return [];
+  }
+  await budgetingBtn.click();
+  await page.waitForTimeout(500);
+
+  const cashFlowItem = await page.$('[data-testid="submenu-link-cashflow"]');
+  if (!cashFlowItem) {
+    // Try clicking away to close menu and retry
+    console.log("  ⚠️  Could not find Cash Flow menu item");
+    await page.keyboard.press("Escape");
+    return [];
+  }
+  await cashFlowItem.click();
+
+  try {
+    await page.waitForSelector('[role="grid"]', { timeout: 15000 });
+  } catch {
+    console.log("  ⚠️  Cash Flow page didn't load");
+    return [];
+  }
+
+  // Change date range to 90 days for more data
+  try {
+    const dateDropdown = await page.$('select, [role="combobox"]:near(:text("Date range"))');
+    if (dateDropdown) {
+      await dateDropdown.click();
+      await page.waitForTimeout(300);
+      // Look for 90 Days option
+      const option90 = await page.$('li:has-text("90 Days"), [role="option"]:has-text("90 Days")');
+      if (option90) {
+        await option90.click();
+        await page.waitForTimeout(2000);
+        console.log("  📅 Set date range to 90 days");
+      }
+    }
+  } catch {
+    console.log("  📅 Using default date range");
+  }
+
+  const allTransactions: ScrapedTransaction[] = [];
+  let hasMore = true;
+
+  while (hasMore) {
+    // Scrape current page of transactions
+    const pageTransactions = await page.evaluate(() => {
+      const results: Array<{
+        date: string;
+        accountName: string;
+        description: string;
+        category: string;
+        amount: string;
+      }> = [];
+
+      const main = document.querySelector("main") || document;
+      const rows = main.querySelectorAll(
+        '[role="grid"] [role="rowgroup"]:last-child [role="row"]'
+      );
+
+      for (const row of rows) {
+        const cells = row.querySelectorAll('[role="gridcell"]');
+        if (cells.length < 6) continue;
+
+        const dateText = cells[0]?.textContent?.trim() || "";
+        const accountText = cells[1]?.textContent?.trim() || "";
+        const descText = cells[2]?.textContent?.trim() || "";
+        const catText = cells[3]?.textContent?.trim() || "";
+        const amountText = cells[5]?.textContent?.trim() || "";
+
+        // Skip total row
+        if (dateText === "Total" || descText === "") continue;
+
+        results.push({
+          date: dateText,
+          accountName: accountText,
+          description: descText,
+          category: catText,
+          amount: amountText,
+        });
+      }
+
+      return results;
+    });
+
+    for (const txn of pageTransactions) {
+      if (txn.date === "Total") continue;
+      allTransactions.push({
+        date: txn.date,
+        accountName: txn.accountName,
+        description: txn.description,
+        category: txn.category,
+        tags: null,
+        amount: parseDollar(txn.amount),
+      });
+    }
+
+    // Check for next page
+    const nextButton = await page.$('button:has-text("Go to next page"):not([disabled])');
+    if (nextButton) {
+      await nextButton.click();
+      await page.waitForTimeout(1500);
+    } else {
+      hasMore = false;
+    }
+  }
+
+  console.log(`  📋 Found ${allTransactions.length} transactions`);
+  return allTransactions;
+}
+
+// --- Allocation scraper (from Investing > Allocations page) ---
+
+interface ScrapedAllocation {
+  assetClass: string;
+  value: number;
+  percentTotal: number;
+  dayChangePercent: number | null;
+}
+
+async function scrapeAllocations(page: Page): Promise<ScrapedAllocation[]> {
+  console.log("\n📊 Scraping allocations...");
+
+  // Navigate to Investing > Allocations
+  const investingBtn = await page.$('button:has-text("Investing")');
+  if (!investingBtn) {
+    console.log("  ⚠️  Could not find Investing menu");
+    return [];
+  }
+  await investingBtn.click();
+  await page.waitForTimeout(500);
+
+  const allocItem = await page.$('[data-testid="submenu-link-allocations"]');
+  if (!allocItem) {
+    console.log("  ⚠️  Could not find Allocations menu item");
+    await page.keyboard.press("Escape");
+    return [];
+  }
+  await allocItem.click();
+
+  try {
+    await page.waitForSelector('[role="grid"]', { timeout: 15000 });
+  } catch {
+    console.log("  ⚠️  Allocations page didn't load");
+    return [];
+  }
+
+  await page.waitForTimeout(1000);
+
+  const allocations = await page.evaluate(() => {
+    const results: Array<{
+      assetClass: string;
+      percentTotal: string;
+      dayChangePercent: string;
+      value: string;
+    }> = [];
+
+    const main = document.querySelector("main") || document;
+    const rows = main.querySelectorAll(
+      '[role="grid"] [role="rowgroup"]:last-child [role="row"]'
+    );
+
+    for (const row of rows) {
+      const cells = row.querySelectorAll('[role="gridcell"]');
+      if (cells.length < 5) continue;
+
+      const assetClass = cells[1]?.textContent?.trim() || "";
+      const pctTotal = cells[2]?.textContent?.trim() || "0";
+      const dayPct = cells[3]?.textContent?.trim() || "0";
+      const value = cells[4]?.textContent?.trim() || "$0";
+
+      if (!assetClass) continue;
+
+      results.push({
+        assetClass,
+        percentTotal: pctTotal,
+        dayChangePercent: dayPct,
+        value,
+      });
+    }
+
+    return results;
+  });
+
+  const result = allocations.map((a) => ({
+    assetClass: a.assetClass,
+    value: parseDollar(a.value),
+    percentTotal: parsePercent(a.percentTotal),
+    dayChangePercent: parsePercent(a.dayChangePercent),
+  }));
+
+  console.log(`  📊 Found ${result.length} asset classes`);
+  for (const a of result) {
+    console.log(`    ${a.assetClass}: $${a.value.toLocaleString()} (${a.percentTotal}%)`);
+  }
+
+  return result;
+}
+
+// --- Performance scraper (from Investing > Performance page) ---
+
+interface ScrapedPerformance {
+  accountName: string;
+  accountType: string | null;
+  cashFlow: number;
+  income: number;
+  expense: number;
+  priorDayPct: number | null;
+  periodPct: number | null;
+  balance: number;
+}
+
+async function scrapePerformance(page: Page): Promise<ScrapedPerformance[]> {
+  console.log("\n📈 Scraping performance...");
+
+  // Navigate to Investing > Performance
+  const investingBtn = await page.$('button:has-text("Investing")');
+  if (!investingBtn) {
+    console.log("  ⚠️  Could not find Investing menu");
+    return [];
+  }
+  await investingBtn.click();
+  await page.waitForTimeout(500);
+
+  const perfItem = await page.$('[data-testid="submenu-link-performance"]');
+  if (!perfItem) {
+    console.log("  ⚠️  Could not find Performance menu item");
+    await page.keyboard.press("Escape");
+    return [];
+  }
+  await perfItem.click();
+
+  try {
+    await page.waitForSelector('[role="grid"]', { timeout: 15000 });
+  } catch {
+    console.log("  ⚠️  Performance page didn't load");
+    return [];
+  }
+
+  await page.waitForTimeout(1000);
+
+  const performances = await page.evaluate(() => {
+    const results: Array<{
+      accountName: string;
+      accountType: string | null;
+      cashFlow: string;
+      income: string;
+      expense: string;
+      priorDayPct: string;
+      periodPct: string;
+      balance: string;
+    }> = [];
+
+    const main = document.querySelector("main") || document;
+    const rows = main.querySelectorAll(
+      '[role="grid"] [role="rowgroup"]:last-child [role="row"]'
+    );
+
+    for (const row of rows) {
+      const cells = row.querySelectorAll('[role="gridcell"]');
+      if (cells.length < 8) continue;
+
+      // Cell 1 has account info: institution name (h3) + account type (span)
+      const acctCell = cells[1];
+      const h3 = acctCell?.querySelector("h3");
+      const institution = h3?.textContent?.trim() || "";
+      const typeSpan = acctCell?.querySelector("span, div:not(:has(h3))");
+      const accountType = typeSpan?.textContent?.trim() || null;
+
+      const cashFlow = cells[2]?.textContent?.trim() || "$0";
+      const income = cells[3]?.textContent?.trim() || "$0";
+      const expense = cells[4]?.textContent?.trim() || "$0";
+      const priorDayPct = cells[5]?.textContent?.trim() || "0";
+      const periodPct = cells[6]?.textContent?.trim() || "0";
+      const balance = cells[7]?.textContent?.trim() || "$0";
+
+      if (!institution || institution === "Grand Total") continue;
+
+      results.push({
+        accountName: institution,
+        accountType: accountType !== institution ? accountType : null,
+        cashFlow,
+        income,
+        expense,
+        priorDayPct,
+        periodPct,
+        balance,
+      });
+    }
+
+    return results;
+  });
+
+  const result = performances.map((p) => ({
+    accountName: p.accountName,
+    accountType: p.accountType,
+    cashFlow: parseDollar(p.cashFlow),
+    income: parseDollar(p.income),
+    expense: parseDollar(p.expense),
+    priorDayPct: parsePercent(p.priorDayPct),
+    periodPct: parsePercent(p.periodPct),
+    balance: parseDollar(p.balance),
+  }));
+
+  console.log(`  📈 Found ${result.length} account performance records`);
+  for (const p of result) {
+    console.log(`    ${p.accountName}: ${p.periodPct >= 0 ? "+" : ""}${p.periodPct}% (90d) | $${p.balance.toLocaleString()}`);
+  }
+
+  return result;
+}
+
 // --- Main scrape orchestrator ---
 
 export async function scrapeEmpower(): Promise<number> {
@@ -650,6 +981,66 @@ export async function scrapeEmpower(): Promise<number> {
         });
         console.log(`    ${holding.ticker || "---"} | ${holding.fundName.slice(0, 40)} | ${holding.shares} shares @ $${holding.price} = $${holding.value.toLocaleString()}`);
       }
+    }
+
+    // Navigate back to dashboard before new scrapes
+    if (!page.url().includes("dashboard/#/user/home")) {
+      await page.click('a:has-text("Go to dashboard")').catch(async () => {
+        await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" });
+      });
+      await page.waitForSelector('[id="networth-balance"]', { timeout: 15000 });
+    }
+
+    // Scrape transactions from Cash Flow page
+    const transactions = await scrapeTransactions(page);
+    for (const txn of transactions) {
+      insertTransaction(snapshotId, {
+        account_name: txn.accountName,
+        date: txn.date,
+        description: txn.description,
+        category: txn.category,
+        amount: txn.amount,
+        tags: txn.tags,
+      });
+    }
+
+    // Navigate back to dashboard
+    await page.click('a:has-text("Go to dashboard")').catch(async () => {
+      await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" });
+    });
+    await page.waitForSelector('[id="networth-balance"]', { timeout: 15000 });
+
+    // Scrape allocations
+    const allocations = await scrapeAllocations(page);
+    for (const alloc of allocations) {
+      insertAllocation(snapshotId, {
+        asset_class: alloc.assetClass,
+        value: alloc.value,
+        percent_total: alloc.percentTotal,
+        day_change_percent: alloc.dayChangePercent,
+      });
+    }
+
+    // Navigate back to dashboard
+    await page.click('a:has-text("Go to dashboard")').catch(async () => {
+      await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" });
+    });
+    await page.waitForSelector('[id="networth-balance"]', { timeout: 15000 });
+
+    // Scrape performance
+    const performances = await scrapePerformance(page);
+    for (const perf of performances) {
+      insertPerformance(snapshotId, {
+        account_name: perf.accountName,
+        account_type: perf.accountType,
+        cash_flow: perf.cashFlow,
+        income: perf.income,
+        expense: perf.expense,
+        prior_day_pct: perf.priorDayPct,
+        period_pct: perf.periodPct,
+        balance: perf.balance,
+        period_days: 90,
+      });
     }
 
     // Scrape Zillow for home value (doesn't need browser)

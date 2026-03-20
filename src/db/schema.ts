@@ -55,9 +55,47 @@ function migrate(db: Database) {
       day_change_percent REAL
     );
 
+    CREATE TABLE IF NOT EXISTS transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+      account_name TEXT NOT NULL,
+      date TEXT NOT NULL,
+      description TEXT NOT NULL,
+      category TEXT NOT NULL,
+      amount REAL NOT NULL,
+      tags TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS allocations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+      asset_class TEXT NOT NULL,
+      value REAL NOT NULL,
+      percent_total REAL NOT NULL,
+      day_change_percent REAL
+    );
+
+    CREATE TABLE IF NOT EXISTS performance (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+      account_name TEXT NOT NULL,
+      account_type TEXT,
+      cash_flow REAL NOT NULL DEFAULT 0,
+      income REAL NOT NULL DEFAULT 0,
+      expense REAL NOT NULL DEFAULT 0,
+      prior_day_pct REAL,
+      period_pct REAL,
+      balance REAL NOT NULL,
+      period_days INTEGER NOT NULL DEFAULT 90
+    );
+
     CREATE INDEX IF NOT EXISTS idx_snapshots_date ON snapshots(scraped_at);
     CREATE INDEX IF NOT EXISTS idx_accounts_snapshot ON accounts(snapshot_id);
     CREATE INDEX IF NOT EXISTS idx_holdings_snapshot ON holdings(snapshot_id);
     CREATE INDEX IF NOT EXISTS idx_holdings_ticker ON holdings(ticker);
+    CREATE INDEX IF NOT EXISTS idx_transactions_snapshot ON transactions(snapshot_id);
+    CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
+    CREATE INDEX IF NOT EXISTS idx_allocations_snapshot ON allocations(snapshot_id);
+    CREATE INDEX IF NOT EXISTS idx_performance_snapshot ON performance(snapshot_id);
   `);
 }
