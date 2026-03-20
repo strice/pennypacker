@@ -41,30 +41,12 @@ async function loadCookies(context: BrowserContext): Promise<boolean> {
 // --- Auth flow ---
 
 async function ensureLoggedIn(page: Page, context: BrowserContext): Promise<boolean> {
-  const hasCookies = await loadCookies(context);
-
-  if (hasCookies) {
-    // Try the dashboard with saved cookies
-    console.log("  🔄 Trying saved session...");
-    await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" });
-
-    try {
-      await page.waitForSelector('[id="networth-balance"]', { timeout: 20000 });
-      console.log("  ✅ Logged in with saved cookies");
-      return true;
-    } catch {
-      console.log("  ⚠️  Saved cookies expired, clearing for fresh login...");
-      // Clear stale cookies so they don't interfere with fresh login
-      await context.clearCookies();
-    }
-  }
-
   if (HEADLESS) {
-    console.error("  ❌ Not logged in and running headless. Run with HEADLESS=false first to log in.");
+    console.error("  ❌ Cannot log in headless — Empower requires interactive 2FA.");
     return false;
   }
 
-  // Fresh login — no stale cookies to confuse things
+  // Always start fresh — Empower sessions don't survive between browser instances
   console.log("\n  🔐 Opening login page...");
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
 
