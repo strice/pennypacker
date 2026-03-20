@@ -272,49 +272,65 @@ async function parseSidebarAccounts(page: Page): Promise<ScrapedAccount[]> {
     const ariaLabel = await button.getAttribute("aria-label");
     const text = await button.innerText().catch(() => "");
 
-    // Account buttons have patterns like:
-    // "Ally Bank 6735 • 13m ago $4,122 +$3,891"
-    // "Vanguard 4156 • 13m ago $158,572 +$11,519"
-    // "CareFirst CareFirst HSA • 0m ago $965 Manual"
-    // "SunTrust Mortgage 9645 • 12m ago $185,312 -$7,299"
-    // "Home 3102 Trellis Ln • 7d ago $492,500 Manual"
-    // "American Express Cards 1001 • 135d ago $1,400 -$241"
+    // innerText comes as newline-separated lines like:
+    //   "Vanguard"
+    //   "4156 • 15m ago"
+    //   "$158,572"      (sr-only duplicate)
+    //   "$158,572"      (visible balance)
+    //   "+$11,519"      (change amount)
+    // Or for manual accounts, last line is "Manual"
+    //
+    // ariaLabel is cleaner single-line:
+    //   "Vanguard 4156 • 15m ago $158,572 +$11,519"
 
-    const accountPattern = /^(.+?)\s+(.+?)\s+•\s+\d+[mhd]\s+ago\s+\$([\d,]+(?:\.\d+)?)\s+(.+)$/;
-    const fullText = (ariaLabel || text).replace(/\n/g, " ").trim();
-    const match = fullText.match(accountPattern);
+    // Parse from newline-separated innerText (more reliable than regex on collapsed text)
+    const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+    if (lines.length < 3) continue;
 
-    if (match) {
-      const [, institution, detail, balanceStr, changeStr] = match;
+    // Find the line with "• Xm ago" — that splits institution/detail from balance/change
+    const agoLineIdx = lines.findIndex(l => /•\s+\d+[mhd]\s+ago/.test(l));
+    if (agoLineIdx === -1) continue;
 
-      // Determine account number (4-digit number in detail)
-      const acctNumMatch = detail.match(/^(\d{4})\b/);
-      const accountNumber = acctNumMatch ? acctNumMatch[1] : null;
+    const institution = lines.slice(0, agoLineIdx).join(" ").trim();
+    const detailLine = lines[agoLineIdx]; // e.g. "4156 • 15m ago"
 
-      // Determine name from detail
-      const name = accountNumber
-        ? detail.replace(/^\d{4}\s*/, "").trim() || institution
-        : detail.trim();
+    // Everything after the ago line: balance values and change
+    const afterAgo = lines.slice(agoLineIdx + 1);
+    // Last item is either a change amount (+$X / -$X) or "Manual"
+    const lastItem = afterAgo[afterAgo.length - 1] || "";
+    const isManual = lastItem === "Manual";
 
-      const balance = parseDollar(balanceStr);
-      const isManual = changeStr.trim() === "Manual";
-      const changeAmount = isManual ? null : parseDollar(changeStr);
+    // Balance is the first dollar amount after the ago line
+    const balanceStr = afterAgo.find(l => l.startsWith("$")) || "$0";
+    const balance = parseDollar(balanceStr);
 
-      // Categorize
-      const { category, assetOrLiability } = categorizeAccount(institution, name, fullText);
+    // Change is the last item (if it starts with + or - or is "Manual")
+    const changeAmount = isManual ? null : parseDollar(lastItem);
 
-      accounts.push({
-        name: name || institution,
-        institution,
-        accountNumber,
-        category,
-        assetOrLiability,
-        balance,
-        changeAmount,
-        changeLabel: changeStr.trim(),
-        isManual,
-      });
-    }
+    // Extract account number from detail line
+    const acctNumMatch = detailLine.match(/^(\d{4})\s+•/);
+    const accountNumber = acctNumMatch ? acctNumMatch[1] : null;
+
+    // Extract name from detail (everything before "•")
+    const detailName = detailLine.replace(/\s*•.*$/, "").trim();
+    const name = accountNumber
+      ? detailName.replace(/^\d{4}\s*/, "").trim() || institution
+      : detailName;
+
+    const fullText = `${institution} ${detailLine} ${balanceStr} ${lastItem}`;
+    const { category, assetOrLiability } = categorizeAccount(institution, name, fullText);
+
+    accounts.push({
+      name: name || institution,
+      institution,
+      accountNumber,
+      category,
+      assetOrLiability,
+      balance,
+      changeAmount,
+      changeLabel: lastItem,
+      isManual,
+    });
   }
 
   return accounts;
