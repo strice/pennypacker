@@ -5,7 +5,10 @@ import {
   insertSnapshot,
   insertAccount,
   insertHolding,
+  getLatestSnapshot,
+  getAccountsForSnapshot,
 } from "../db/queries";
+import { scrapeZillow } from "./zillow";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "../..");
 const COOKIE_PATH = resolve(PROJECT_ROOT, process.env.COOKIE_PATH || "cookies.json");
@@ -296,20 +299,23 @@ function categorizeAccount(
   if (lower.includes("home") || lower.includes("trellis")) {
     return { category: "property", assetOrLiability: "asset" };
   }
-  if (lower.includes("vehicle") || lower.includes("car")) {
+  if (lower.includes("vehicle")) {
     return { category: "vehicle", assetOrLiability: "asset" };
+  }
+  // HSA checks must come before generic institution checks
+  if (lower.includes("hsa") && lower.includes("investment")) {
+    return { category: "investment", assetOrLiability: "asset" };
+  }
+  if (lower.includes("hsa")) {
+    return { category: "cash", assetOrLiability: "asset" };
   }
   if (
     lower.includes("vanguard") ||
     lower.includes("fidelity") ||
-    lower.includes("hsa investment") ||
     lower.includes("savings bond") ||
     lower.includes("treasurydirect")
   ) {
     return { category: "investment", assetOrLiability: "asset" };
-  }
-  if (lower.includes("hsa") && !lower.includes("investment")) {
-    return { category: "cash", assetOrLiability: "asset" };
   }
   if (
     lower.includes("savings") ||
@@ -325,22 +331,96 @@ function categorizeAccount(
 
 // --- Holdings scraper ---
 
-async function scrapeHoldings(page: Page, accountRef: string): Promise<ScrapedHolding[]> {
-  // Click the account to navigate to detail view
-  await page.click(`button:has-text("${accountRef}")`);
+async function findAccountUrls(page: Page): Promise<Map<string, string>> {
+  // When you click an account in the sidebar, the URL changes to include a `ua=` param.
+  // We can find these by looking at where sidebar account clicks navigate to.
+  // Strategy: click each investment account, capture the URL, go back.
+  // But that's fragile. Better: look for the ua param in the page's network or DOM.
 
-  // Wait for detail page to load
-  await page.waitForSelector('text=Holdings', { timeout: 10000 });
+  // From our exploration, the detail URL pattern is:
+  // /dashboard/#/accounts/details?ua=XXXXXXX&firmName=Vanguard
+  // We need to discover the `ua` values.
 
-  // Click Holdings tab
-  await page.click('a:has-text("Holdings")');
-  await page.waitForSelector('table', { timeout: 10000 });
+  // Let's find them by evaluating click handlers or by clicking and capturing URLs
+  const urls = new Map<string, string>();
 
-  // Small delay for table to render
-  await page.waitForTimeout(1000);
+  console.log("  🔍 Discovering account detail URLs...");
+
+  // Find all sidebar account buttons and click each to discover their URLs
+  const buttons = await page.$$('button[data-testid="click-account-card"]');
+  console.log(`  📋 Found ${buttons.length} account cards`);
+
+  for (const button of buttons) {
+    const buttonText = await button.innerText().catch(() => "");
+    const cleanText = buttonText.replace(/\n/g, " ").trim();
+
+    // Only care about investment accounts (have Vanguard, Fidelity, CareFirst HSA Investment)
+    const isInvestment = /vanguard|fidelity|hsa investment/i.test(cleanText);
+    if (!isInvestment) continue;
+
+    console.log(`  🖱️  Clicking: ${cleanText.slice(0, 60)}...`);
+
+    try {
+      await button.click();
+      await page.waitForURL("**/accounts/details**", { timeout: 10000 });
+      const url = page.url();
+      console.log(`  📎 URL: ${url}`);
+
+      // Extract account identifier from button text
+      const acctMatch = cleanText.match(/(\w+)\s+(\d{4})\s+•/);
+      if (acctMatch) {
+        const key = `${acctMatch[1]} ${acctMatch[2]}`;
+        urls.set(key, url);
+      } else {
+        // For accounts without 4-digit number (like CareFirst HSA Investment)
+        const nameMatch = cleanText.match(/^(.+?)\s+•/);
+        if (nameMatch) urls.set(nameMatch[1].trim(), url);
+      }
+
+      // Go back to dashboard
+      await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" });
+      await page.waitForSelector('[id="networth-balance"]', { timeout: 15000 });
+    } catch (err) {
+      console.log(`  ⚠️  Could not get URL for: ${cleanText.slice(0, 40)} — ${err}`);
+      // Make sure we're back on dashboard
+      await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForSelector('[id="networth-balance"]', { timeout: 15000 }).catch(() => {});
+    }
+  }
+
+  return urls;
+}
+
+async function scrapeHoldingsFromUrl(page: Page, detailUrl: string): Promise<ScrapedHolding[]> {
+  // Navigate to the holdings tab directly
+  const holdingsUrl = detailUrl.includes("tabId=")
+    ? detailUrl.replace(/tabId=\w+/, "tabId=holdings")
+    : detailUrl + "&tabId=holdings";
+
+  console.log(`  🔗 Navigating to holdings: ${holdingsUrl.slice(0, 80)}...`);
+  await page.goto(holdingsUrl, { waitUntil: "domcontentloaded" });
+
+  // Wait for the holdings grid to render
+  try {
+    await page.waitForSelector('[role="grid"], table', { timeout: 15000 });
+  } catch {
+    console.log("  ⚠️  No holdings grid found, checking page...");
+    const pageText = await page.innerText('body').catch(() => "");
+    console.log(`  📄 Page contains: ${pageText.slice(0, 200)}...`);
+    return [];
+  }
+
+  // Small delay for data to populate
+  await page.waitForTimeout(1500);
 
   const holdings = await page.evaluate(() => {
-    const rows = document.querySelectorAll('table tbody tr, [role="grid"] [role="rowgroup"]:last-child [role="row"]');
+    // Try both table and grid-role selectors
+    const gridRows = document.querySelectorAll('[role="grid"] [role="rowgroup"]:last-child [role="row"]');
+    const tableRows = document.querySelectorAll('table tbody tr');
+    const rows = gridRows.length > 0 ? gridRows : tableRows;
+
+    console.log(`Found ${rows.length} rows`); // browser console
+
     const results: Array<{
       ticker: string | null;
       fundName: string;
@@ -362,12 +442,12 @@ async function scrapeHoldings(page: Page, accountRef: string): Promise<ScrapedHo
       const dayChangeText = cells[4]?.textContent?.trim() || "0";
       const dayPctText = cells[5]?.textContent?.trim() || "0";
 
-      // Skip the "Grand Total" row
+      // Skip header-like rows and totals
       if (holdingCell.toLowerCase().includes("grand total")) continue;
-      // Skip "Cash Cash" with 0 value
+      if (holdingCell.toLowerCase() === "holding") continue;
       if (holdingCell === "Cash Cash" && valueText === "$0.00") continue;
 
-      // Extract ticker — it's the first word if it's all caps
+      // Extract ticker — first word if all caps 2-6 chars
       const tickerMatch = holdingCell.match(/^([A-Z]{2,6})\b/);
       const ticker = tickerMatch ? tickerMatch[1] : null;
       const fundName = ticker
@@ -391,6 +471,7 @@ async function scrapeHoldings(page: Page, accountRef: string): Promise<ScrapedHo
     return results;
   });
 
+  console.log(`  📊 Found ${holdings.length} holdings`);
   return holdings;
 }
 
@@ -440,8 +521,8 @@ export async function scrapeEmpower(): Promise<number> {
       sidebar.totalLiabilities
     );
 
-    // Insert accounts
-    const investmentAccounts: Array<{ id: number; ref: string }> = [];
+    // Insert accounts and track investment account IDs
+    const accountIdMap = new Map<string, number>(); // "Institution AcctNum" -> db id
 
     for (const acct of sidebar.accounts) {
       const accountId = insertAccount(snapshotId, {
@@ -458,26 +539,39 @@ export async function scrapeEmpower(): Promise<number> {
 
       console.log(`  💰 ${acct.institution} ${acct.accountNumber || acct.name}: $${acct.balance.toLocaleString()} [${acct.category}]`);
 
-      // Track investment accounts for holdings scraping
-      if (acct.category === "investment" && acct.accountNumber) {
-        const ref = `${acct.institution} ${acct.accountNumber}`;
-        investmentAccounts.push({ id: accountId, ref });
-      }
+      // Map for matching with discovered URLs
+      const key = acct.accountNumber
+        ? `${acct.institution} ${acct.accountNumber}`
+        : `${acct.institution} ${acct.name}`;
+      accountIdMap.set(key, accountId);
     }
 
-    // Scrape holdings for each investment account
-    for (const { id: accountId, ref } of investmentAccounts) {
+    // Discover account detail URLs by clicking sidebar buttons
+    const accountUrls = await findAccountUrls(page);
+    console.log(`\n  🗺️  Discovered ${accountUrls.size} investment account URLs`);
+
+    // Scrape holdings for each discovered investment account
+    for (const [ref, url] of accountUrls) {
       console.log(`\n📈 Scraping holdings for ${ref}...`);
 
-      try {
-        // Navigate back to dashboard first
-        await page.goto(DASHBOARD_URL, { waitUntil: "domcontentloaded" });
-        await page.waitForSelector('[id="networth-balance"]', { timeout: 15000 });
+      // Find matching account ID
+      const accountId = accountIdMap.get(ref);
+      if (!accountId) {
+        // Try fuzzy match
+        const fuzzyKey = [...accountIdMap.keys()].find(k => k.includes(ref) || ref.includes(k));
+        if (!fuzzyKey) {
+          console.log(`  ⚠️  No matching account in DB for "${ref}", skipping`);
+          continue;
+        }
+        console.log(`  🔗 Fuzzy matched "${ref}" → "${fuzzyKey}"`);
+      }
+      const dbId = accountId || accountIdMap.get([...accountIdMap.keys()].find(k => k.includes(ref) || ref.includes(k))!)!;
 
-        const holdings = await scrapeHoldings(page, ref);
+      try {
+        const holdings = await scrapeHoldingsFromUrl(page, url);
 
         for (const holding of holdings) {
-          insertHolding(snapshotId, accountId, {
+          insertHolding(snapshotId, dbId, {
             ticker: holding.ticker,
             fund_name: holding.fundName,
             shares: holding.shares,
@@ -490,6 +584,30 @@ export async function scrapeEmpower(): Promise<number> {
         }
       } catch (err) {
         console.error(`  ⚠️  Failed to scrape holdings for ${ref}: ${err}`);
+      }
+    }
+
+    // Scrape Zillow for home value (doesn't need browser)
+    const zillow = await scrapeZillow();
+    if (zillow) {
+      // Update the home account if it exists in this snapshot
+      const homeAccount = sidebar.accounts.find(a => a.category === "property");
+      if (homeAccount) {
+        const db = (await import("../db/schema")).getDb();
+        db.run(
+          `UPDATE accounts SET balance = ?, change_label = 'Zillow Zestimate' WHERE snapshot_id = ? AND category = 'property'`,
+          [zillow.zestimate, snapshotId]
+        );
+        console.log(`  🏠 Updated home value: $${homeAccount.balance.toLocaleString()} → $${zillow.zestimate.toLocaleString()}`);
+
+        // Recalculate net worth with updated home value
+        const diff = zillow.zestimate - homeAccount.balance;
+        if (diff !== 0) {
+          db.run(
+            `UPDATE snapshots SET net_worth = net_worth + ?, total_assets = total_assets + ? WHERE id = ?`,
+            [diff, diff, snapshotId]
+          );
+        }
       }
     }
 
